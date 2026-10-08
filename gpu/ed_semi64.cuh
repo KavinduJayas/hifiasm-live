@@ -8,6 +8,9 @@
 // Differences from the CPU version:
 //   - sequences are 2-bit codes (0..3, 4 = N) rather than ASCII, so there is no
 //     seq_nt4_table lookup. Convert with ha_nt4() on the host.
+//   - the algorithm is a template over the sequence accessors P/T: anything with
+//     operator[](int32_t) -> uint8_t. ed_replay.cu uses plain pointers; ed_batch.cu
+//     decodes straight from the GPU-resident 2-bit reads.
 //   - results are returned through out params instead of bit_extz_t. The CPU version
 //     also sets ps=-1, ts=0, te=tn-1 and thre; those are constant per call.
 //   - __host__ __device__ so the harness can run the same code on the CPU for timing.
@@ -31,8 +34,11 @@
     (VP) = (HN) | ~((X) | (HP));                        \
 }
 
-HA_HD void ha_ed_semi64_absent_diag(const uint8_t *p, int32_t pn, const uint8_t *t, int32_t tn,
-                                    int32_t thre, int32_t abs_diag, int32_t *o_err, int32_t *o_pe)
+// Accessors are taken by value on purpose: a by-reference struct with mutable state
+// forces it into local memory on the GPU, a local copy can live in registers.
+template <class P, class T>
+HA_HD void ha_ed_semi64_absent_diag_t(P p, int32_t pn, T t, int32_t tn,
+                                      int32_t thre, int32_t abs_diag, int32_t *o_err, int32_t *o_pe)
 {
     int32_t res_err = INT32_MAX, res_pe = -1;
     uint64_t c, Peq[5] = {0, 0, 0, 0, 0}, VP = 0, VN, X, D0, HN, HP, mm;
@@ -83,6 +89,13 @@ HA_HD void ha_ed_semi64_absent_diag(const uint8_t *p, int32_t pn, const uint8_t 
 
 done:
     *o_err = res_err; *o_pe = res_pe;
+}
+
+// Plain-pointer instantiation (used by ed_replay.cu).
+HA_HD void ha_ed_semi64_absent_diag(const uint8_t *p, int32_t pn, const uint8_t *t, int32_t tn,
+                                    int32_t thre, int32_t abs_diag, int32_t *o_err, int32_t *o_pe)
+{
+    ha_ed_semi64_absent_diag_t<const uint8_t *, const uint8_t *>(p, pn, t, tn, thre, abs_diag, o_err, o_pe);
 }
 
 // Same mapping as seq_nt4_table in htab.cpp: ACGT/acgt -> 0..3, U/u -> 3, else 4.

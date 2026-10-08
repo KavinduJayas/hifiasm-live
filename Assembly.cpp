@@ -4,6 +4,7 @@
 #include <zlib.h>
 #include <pthread.h>
 #include "Assembly.h"
+#include "gpu/ed_batch.h"
 #include "Process_Read.h"
 #include "CommandLines.h"
 #include "Hash_Table.h"
@@ -1076,6 +1077,12 @@ void ha_ec(int64_t round, int num_pround, int des_idx, uint64_t *tot_b, uint64_t
 
     // Output_corrected_fastq();
 
+    // Reads change between rounds (sl_ec / post_rev), so refresh the GPU copy each round.
+    if (asm_opt.use_gpu && !ha_gpu_upload_reads(&R_INF)) {
+        fprintf(stderr, "[ERROR] failed to upload reads to the GPU\n");
+        exit(1);
+    }
+
     cal_ec_r(asm_opt.thread_num, round, num_pround, R_INF.total_reads, (round == (asm_opt.number_of_round-1))?1:0, tot_b, tot_e);
 
     if (r_out) write_pt_index(ha_flt_tab, ha_idx, &R_INF, &asm_opt, asm_opt.output_file_name);
@@ -2119,6 +2126,10 @@ int ha_assemble(void)
 	extern void ha_extract_print_list(const All_reads *rs, int n_rounds, const char *o);
 	int r, hom_cov = -1, ovlp_loaded = 0; uint64_t tot_b, tot_e;
     pthread_t ec_write_tid; int ec_write_started = 0;
+    if (asm_opt.use_gpu && !ha_gpu_init()) {
+        fprintf(stderr, "[ERROR] GPU initialisation failed\n");
+        exit(1);
+    }
     //KJ: TODO: check if -j was given with only one file name. warn user and ask if want to load prefix.ec.fq
 	if (asm_opt.load_index_from_disk && load_all_data_from_disk(&R_INF.paf, &R_INF.reverse_paf, asm_opt.output_file_name)) {
 		ovlp_loaded = 1;
@@ -2288,6 +2299,7 @@ int ha_assemble(void)
         fprintf(stderr, "[M::%s] keep-alive: EOF received, shutting down\n", __func__);
     }
 
+    if (asm_opt.use_gpu) ha_gpu_destroy();
 	destory_All_reads(&R_INF);
 	return 0;
 }

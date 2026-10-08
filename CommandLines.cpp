@@ -15,6 +15,8 @@ KSEQ_INIT(gzFile, gzread)
 
 hifiasm_opt_t asm_opt;
 
+#include "gpu/ed_batch.h"
+
 static ko_longopt_t long_options[] = {
 	{ "version",       ko_no_argument, 300 },
 	{ "dbg-gfa",       ko_no_argument, 301 },
@@ -83,6 +85,7 @@ static ko_longopt_t long_options[] = {
     { "sc-cut",     ko_required_argument, 365},
     { "keep-alive", ko_no_argument,       366},
     { "dirty-ec",   ko_no_argument,       367},
+    { "gpu",        ko_no_argument,       368},
     // { "path-round",     ko_required_argument, 348},
 	{ 0, 0, 0 }
 };
@@ -280,6 +283,7 @@ void init_opt(hifiasm_opt_t* asm_opt)
     asm_opt->load_index_from_disk = 1;
     asm_opt->continue_from_prev_state = 0;
     asm_opt->dirty_ec = 0;
+    asm_opt->use_gpu = 0;
     asm_opt->write_index_to_disk = 1;
     asm_opt->number_of_round = 3;
     asm_opt->number_of_pround = 0/**3**/;
@@ -750,6 +754,11 @@ int check_option(hifiasm_opt_t* asm_opt)
         return 0;
     }
 
+    if (asm_opt->use_gpu && !ha_gpu_available()) {
+        fprintf(stderr, "[ERROR] --gpu requires a build with CUDA support (make GPU=1)\n");
+        return 0;
+    }
+
     if(asm_opt->telo_motif) {
         uint64_t k, tlen = strlen((asm_opt->telo_motif)); char c;
         if(tlen > 32) {
@@ -1022,6 +1031,8 @@ int CommandLine_process(int argc, char *argv[], hifiasm_opt_t* asm_opt)
             asm_opt->keep_alive = 1;
         } else if (c == 367) {
             asm_opt->dirty_ec = 1;
+        } else if (c == 368) {
+            asm_opt->use_gpu = 1;
         } else if (c == 'l') {   ///0: disable purge_dup; 1: purge containment; 2: purge overlap
             asm_opt->purge_level_primary = asm_opt->purge_level_trio = atoi(opt.arg);
         }

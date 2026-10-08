@@ -65,11 +65,45 @@ Steps:
    disappears once reads are GPU-resident (step 3). Kernel is memory-access bound
    (one uncoalesced byte load per column per thread); next kernel-level win is packed
    2-bit loads (16 bases per 32-bit word) and/or staging windows in shared memory.
-2. Batch collection in `gen_hc_r_alin`/`align_hc_ed_post_extz`: emit jobs into a
-   per-thread queue, flush to GPU per `REFRESH_N`-sized read batch, resume CPU
-   post-processing from results.
-3. GPU-resident 2-bit reads (`R_INF.read_sperate` concatenated + offsets) so jobs carry
-   coordinates, not bases.
+2. + 3. **Done: `--gpu` (`make GPU=1`).** Implementation in `gpu/ed_batch.{h,cu}`,
+   hooked into `Correct.cpp` (`enum_hc_ed_wins_gpu`, `gen_hc_r_alin`,
+   `gen_hc_r_alin_nec`, `align_hc_ed_post_extz`), `Assembly.cpp` (`ha_gpu_init` /
+   `ha_gpu_upload_reads` per EC round / `ha_gpu_destroy`) and `CommandLines.cpp`.
+   - Reads are uploaded once per EC round in their existing 2-bit packing
+     (`read_sperate`, padded to 8 bytes per read) plus a CSR list of N positions from
+     `N_site`; the device accessor reproduces `recover_UC_Read_sub_region` including
+     reverse strand and N restoration. A job is 36 bytes of coordinates.
+   - Per read, `gen_hc_r_alin` enumerates every first-pass window of every overlap
+     (same loop as `align_hc_ed_post_extz`), submits them as one context, and the
+     unchanged CPU code then consumes `(err, pe)` from the result array instead of
+     calling the kernel. Gap-fill, traceback, phasing and consensus are untouched.
+   - Worker threads never call CUDA. A single service thread merges every context
+     waiting in the queue into one launch (mean 1.3–10k jobs) and scatters results
+     back; workers block on a condition variable. This matters: per-read batches from
+     16 streams do **not** overlap on the device (`gpu/ed_batchbench.cu`: 0.84 →
+     1.06 M jobs/s going from 1 to 16 threads at batch 500, vs 3.9 M jobs/s at batch
+     8000). `kthread` creates fresh pthreads per pass, so contexts come from a pool,
+     not `thread_local`.
+   - `HA_GPU_VERIFY=1` runs the CPU kernel as well for every window and aborts on the
+     first `err`/`pe` mismatch with full coordinates.
+   - Validation (chr11-2M, 11.1M windows per run): verify mode passes on HiFi, on reads
+     with injected N bases, and in `--ont` mode; `*.p_ctg.gfa`, `ovlp.source.bin` and
+     `ovlp.reverse.bin` are byte-identical to the CPU build (`ec.bin` differs by ~120
+     bytes between any two runs, CPU or GPU — pre-existing nondeterminism).
+   - Timing on the RTX 500 (16 SMs, WSL2), interleaved with CPU runs: steady-state EC
+     rounds are at parity with 16 cores (round 2 +0.2 s, round 3 −0.4 s); the only net
+     loss is the one-off 2.75 s CUDA context creation. Per-round GPU stats
+     (`[M::ha_gpu_upload_reads] ... kernel X s, service Y s, worker wait Z thread-s`)
+     show the device saturated: ~0.34 µs/window in situ, ~0.25 ms WSL2 overhead per
+     launch, and every worker waiting ~0.5 s per round for results. A V100/A100 has
+     ~6–10x the throughput and ~10x lower launch latency, which is where the predicted
+     EC-round gain (~25–35%) should appear. `scripts/gadi/run_e1_sr_gpu.pbs` runs the
+     E1 job with `--gpu` on `dgxa100`.
+   - Next kernel-level wins if the Gadi run is GPU-bound: cheaper device accessor
+     (hoist the word reload out of the per-base path), warp-level work for the
+     `aux_beg`/tail loops, and overlapping worker wait with other reads
+     (oversubscribing `-t` to ~2x cores is a zero-code approximation; `-t32` on 22
+     cores was ~5% faster here).
 
 ### T2. Chain-gap alignment (`hc_aln_exz_adv_hc`)
 

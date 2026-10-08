@@ -16,6 +16,22 @@ ifneq ($(asan),)
 	LIBS+=-fsanitize=address,undefined,signed-integer-overflow,bounds
 endif
 
+# make GPU=1 [NVCC=... ARCH=sm_XX CUDA_HOME=...] enables --gpu (needs the CUDA toolkit).
+ifneq ($(GPU),)
+	CUDA_HOME?=/usr/local/cuda
+	NVCC?=$(CUDA_HOME)/bin/nvcc
+	ARCH?=sm_89
+	GPU_OBJ=gpu/ed_batch.o
+	LIBS+=-L$(CUDA_HOME)/lib64 -lcudart
+else
+	GPU_OBJ=gpu/ed_batch_stub.o
+endif
+OBJS+=$(GPU_OBJ)
+
+# Relink when switching between the CPU and GPU flavours (the .o files are shared).
+FLAVOUR=.build_flavour_$(EXE)
+$(shell [ "$$(cat $(FLAVOUR) 2>/dev/null)" = "GPU=$(GPU)" ] || echo "GPU=$(GPU)" > $(FLAVOUR))
+
 .SUFFIXES:.cpp .c .o
 .PHONY:all clean depend
 
@@ -27,11 +43,14 @@ endif
 
 all:$(EXE)
 
-$(EXE):$(OBJS) main.o
-		$(CXX) $(CXXFLAGS) $^ -o $@ $(LIBS)
+$(EXE):$(OBJS) main.o $(FLAVOUR)
+		$(CXX) $(CXXFLAGS) $(OBJS) main.o -o $@ $(LIBS)
+
+gpu/ed_batch.o: gpu/ed_batch.cu gpu/ed_semi64.cuh gpu/ed_batch.h All_reads.h
+		$(NVCC) -O3 -arch=$(ARCH) -std=c++14 -c $< -o $@
 
 clean:
-		rm -fr gmon.out *.o a.out $(EXE) *~ *.a *.dSYM
+		rm -fr gmon.out *.o gpu/*.o a.out $(EXE) *~ *.a *.dSYM
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CPPFLAGS) $(DFLAGS) -- *.cpp)

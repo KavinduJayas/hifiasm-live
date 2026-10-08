@@ -18,6 +18,7 @@
 #include "inter.h"
 #include "Process_Read.h"
 #include "ed_dump.h"
+#include "gpu/ed_batch.h"
 #define A_L 16
 #define ext_w 6
 #define r_simi_w 0.05
@@ -12949,10 +12950,40 @@ uint32_t align_ul_ed_post_extz(overlap_region *z, const ul_idx_t *uref, hpc_t *h
 }
 
 
-uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, char *tstr, bit_extz_t *exz, double e_rate, int64_t w_l, double ovlp_cut, int64_t force_aln, void *km)
+// Walks the first-pass windows of z exactly as align_hc_ed_post_extz does and pushes one
+// GPU job per window that passes init_waln. The window loop here and the one below must
+// stay in lockstep: align_hc_ed_post_extz consumes the results in the same order.
+static int enum_hc_ed_wins_gpu(overlap_region *z, All_reads *rref, double e_rate, int64_t w_l, ha_gpu_ctx_t *gc)
+{
+    int64_t q_s, q_e, nw, k, q_l, t_tot_l, aux_beg, aux_end, t_s, thre, aln_l, t_pri_l;
+    ha_gpu_ed_job_t *jb;
+    nw = get_num_wins(z->x_pos_s, z->x_pos_e+1, w_l);
+    get_win_se_by_normalize_xs(z, (z->x_pos_s/w_l)*w_l, w_l, &q_s, &q_e);
+    for (k = 0; k < nw; k++) {
+        aux_beg = aux_end = 0; q_l = 1 + q_e - q_s;
+        thre = q_l*e_rate; thre = Adjust_Threshold(thre, q_l);
+        if(thre > THRESHOLD_MAX_SIZE) thre = THRESHOLD_MAX_SIZE;
+        t_s = (q_s - z->x_pos_s) + z->y_pos_s;
+        t_s += y_start_offset(q_s, &(z->f_cigar));
+
+        aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id);
+        if(init_waln(thre, t_s, t_tot_l, aln_l, &aux_beg, &aux_end, &t_s, &t_pri_l)) {
+            jb = ha_gpu_ctx_push(gc); if(!jb) return 0;
+            jb->x_id = z->x_id; jb->y_id = z->y_id; jb->strand = z->y_pos_strand;
+            jb->q_s = q_s; jb->q_l = q_l; jb->t_s = t_s; jb->t_l = t_pri_l;
+            jb->thre = thre; jb->aux_beg = aux_beg;
+        }
+        q_s = q_e + 1; q_e = q_s + w_l - 1;
+        if(q_e >= (int64_t)z->x_pos_e) q_e = z->x_pos_e;
+    }
+    return 1;
+}
+
+// gres: results from enum_hc_ed_wins_gpu for this overlap, or NULL to run the kernel here.
+uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, char *tstr, bit_extz_t *exz, double e_rate, int64_t w_l, double ovlp_cut, int64_t force_aln, void *km, const ha_gpu_ed_res_t *gres)
 {
     int64_t q_s, q_e, nw, k, q_l, t_l, t_tot_l, aux_beg, aux_end, t_s, thre, aln_l, t_pri_l;
-    char *q_string, *t_string; 
+    char *q_string, *t_string;
     z->w_list.n = 0; z->is_match = 0; z->align_length = 0;
     nw = get_num_wins(z->x_pos_s, z->x_pos_e+1, w_l);
     get_win_se_by_normalize_xs(z, (z->x_pos_s/w_l)*w_l, w_l, &q_s, &q_e);
@@ -12967,16 +12998,31 @@ uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, c
         t_s = (q_s - z->x_pos_s) + z->y_pos_s;
         t_s += y_start_offset(q_s, &(z->f_cigar));
 
-        aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id); 
+        aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id);
         if(init_waln(thre, t_s, t_tot_l, aln_l, &aux_beg, &aux_end, &t_s, &t_pri_l)) {
-            q_string = qstr+q_s; 
+            q_string = qstr+q_s;
             recover_UC_Read_sub_region(tstr, t_s, t_pri_l, z->y_pos_strand, rref, z->y_id); t_string = tstr;
             // t_string = return_str_seq_exz(tstr, t_s, t_pri_l, z->y_pos_strand, hpc_g, uref, z->y_id);
-            
+
             t_l = t_pri_l;
             // t_end = Reserve_Banded_BPM(t_string, aln_l, q_string, q_l, thre, &error);
-            ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
-            ha_ed_dump_semi64(t_string, t_l, q_string, q_l, thre, aux_beg, exz->err, exz->pe); // no-op unless HA_ED_DUMP is set
+            if(gres) {
+                // same fields the CPU kernel sets: init_base_ed + ps/ts/te, then err/pe
+                init_base_ed(*exz, thre, t_l, q_l); exz->ps = exz->pe = -1; exz->ts = 0; exz->te = q_l-1;
+                exz->err = gres->err; exz->pe = gres->pe; gres++;
+                if(ha_gpu_verify) {
+                    int32_t g_err = exz->err, g_pe = exz->pe;
+                    ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+                    if(exz->err != g_err || (is_align(*exz) && exz->pe != g_pe)) {
+                        fprintf(stderr, "[ERROR::ha_gpu_verify] x_id=%u y_id=%u strand=%u q_s=%ld q_l=%ld t_s=%ld t_l=%ld thre=%ld aux_beg=%ld cpu(err=%d,pe=%d) gpu(err=%d,pe=%d)\n",
+                                z->x_id, z->y_id, z->y_pos_strand, q_s, q_l, t_s, t_l, thre, aux_beg, exz->err, exz->pe, g_err, g_pe);
+                        exit(1);
+                    }
+                }
+            } else {
+                ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+                ha_ed_dump_semi64(t_string, t_l, q_string, q_l, thre, aux_beg, exz->err, exz->pe); // no-op unless HA_ED_DUMP is set
+            }
 
             // if(z->x_id == 5569 && z->y_id == 5557 && q_s == 10075 && q_e == 10849) {
             //     fprintf(stderr, "\n[M::%s::semi::t_s->%ld::t_pri_l->%ld::aux_beg->%ld::aux_end->%ld::thre->%ld] exz->ps::%d, exz->pe::%d, exz->ts::%d, exz->te::%d, exz->err::%d, exz->cigar.n::%d, thre::%ld\n", 
@@ -25628,15 +25674,28 @@ void gen_hc_r_alin(overlap_region_alloc* ol, Candidates_list *cl, All_reads *rre
     err = e_rate; e_max = err * 1.5;
     init_Window_Pool(&w, ql, wl, (int)(1.0/err));
     bs = (w.window_length)+(THRESHOLD_MAX_SIZE<<1)+1;
-    resize_UC_Read(tu, bs<<1); 
+    resize_UC_Read(tu, bs<<1);
     // fprintf(stderr, "[M::%s] window_length::%lld, err::%f\n", __func__, w.window_length, err);
+
+    // --gpu: evaluate every first-pass window of every overlap in one batch up front;
+    // the loop below then consumes the results instead of running the kernel per window.
+    // Any failure drops back to the CPU path for this read.
+    ha_gpu_ctx_t *gc = NULL; uint32_t *gstart = NULL; const ha_gpu_ed_res_t *gres = NULL;
+    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL) {
+        gstart = (uint32_t*)malloc(sizeof(uint32_t)*ol->length);
+        for (i = 0; i < ol->length; i++) {
+            gstart[i] = ha_gpu_ctx_n(gc);
+            if(!enum_hc_ed_wins_gpu(&(ol->list[i]), rref, err, w.window_length, gc)) break;
+        }
+        if(i == ol->length && ha_gpu_ctx_run(gc)) gres = ha_gpu_ctx_res(gc);
+    }
 
     for (i = k = 0; i < ol->length; i++) {
         z = &(ol->list[i]); z->shared_seed = z->non_homopolymer_errors;///for index
 
         // if(z->x_id == 19350 && z->y_id == 19324) fprintf(stderr, "-z-[M::%s] tid::%u\t%.*s\n", __func__, z->y_id, (int)Get_NAME_LENGTH(R_INF, z->y_id), Get_NAME(R_INF, z->y_id));
-        
-        if(!align_hc_ed_post_extz(z, rref, qu->seq, tu->seq, exz, err, w.window_length, OVERLAP_THRESHOLD_HIFI_FILTER, 0, NULL)) continue;
+
+        if(!align_hc_ed_post_extz(z, rref, qu->seq, tu->seq, exz, err, w.window_length, OVERLAP_THRESHOLD_HIFI_FILTER, 0, NULL, gres?gres+gstart[i]:NULL)) continue;
 
         // if(z->x_id == 19350 && z->y_id == 19324) fprintf(stderr, "-m-[M::%s] tid::%u\t%.*s\n", __func__, z->y_id, (int)Get_NAME_LENGTH(R_INF, z->y_id), Get_NAME(R_INF, z->y_id));
 
@@ -25671,6 +25730,7 @@ void gen_hc_r_alin(overlap_region_alloc* ol, Candidates_list *cl, All_reads *rre
         z = &(ol->list[k++]); z->is_match = 1; ///z->non_homopolymer_errors = re;
         z->strong = z->without_large_indel = 0;
     }
+    ha_gpu_release(gc); free(gstart);
     ol->length = k;
     if(ol->length <= 0) return;
 }
@@ -25694,14 +25754,26 @@ void gen_hc_r_alin_nec(overlap_region_alloc* ol, Candidates_list *cl, All_reads 
     ///debug for memory
     // snprintf(NULL, 0, "dwn::%u\tdcn::%u", (uint32_t)aux_o->w_list.n, (uint32_t)aux_o->w_list.c.n);
 
+    // --gpu: same batching as gen_hc_r_alin, restricted to the overlaps aligned below
+    ha_gpu_ctx_t *gc = NULL; uint32_t *gstart = NULL; const ha_gpu_ed_res_t *gres = NULL;
+    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL) {
+        gstart = (uint32_t*)malloc(sizeof(uint32_t)*ol->length);
+        for (i = 0; i < ol->length; i++) {
+            gstart[i] = ha_gpu_ctx_n(gc);
+            if(ol->list[i].is_match == 1) continue;
+            if(!enum_hc_ed_wins_gpu(&(ol->list[i]), rref, err, w.window_length, gc)) break;
+        }
+        if(i == ol->length && ha_gpu_ctx_run(gc)) gres = ha_gpu_ctx_res(gc);
+    }
+
     for (i = k = 0; i < ol->length; i++) {
-        z = &(ol->list[i]); 
+        z = &(ol->list[i]);
         if(z->is_match != 1) {
             z->shared_seed = z->non_homopolymer_errors;///for index
 
             // if(z->x_id == 19350 && z->y_id == 19324) fprintf(stderr, "-z-[M::%s] tid::%u\t%.*s\n", __func__, z->y_id, (int)Get_NAME_LENGTH(R_INF, z->y_id), Get_NAME(R_INF, z->y_id));
-            
-            if(!align_hc_ed_post_extz(z, rref, qu->seq, tu->seq, exz, err, w.window_length, OVERLAP_THRESHOLD_HIFI_FILTER, 0, NULL)) continue;
+
+            if(!align_hc_ed_post_extz(z, rref, qu->seq, tu->seq, exz, err, w.window_length, OVERLAP_THRESHOLD_HIFI_FILTER, 0, NULL, gres?gres+gstart[i]:NULL)) continue;
 
             // if(z->x_id == 19350 && z->y_id == 19324) fprintf(stderr, "-m-[M::%s] tid::%u\t%.*s\n", __func__, z->y_id, (int)Get_NAME_LENGTH(R_INF, z->y_id), Get_NAME(R_INF, z->y_id));
 

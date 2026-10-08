@@ -21,3 +21,5 @@ hifiasm
 *.log
 CLAUDE.md
 gpu/ed_replay
+gpu/ed_batchbench
+.build_flavour_*
