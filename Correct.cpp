@@ -17,6 +17,7 @@
 #include "Overlaps.h"
 #include "inter.h"
 #include "Process_Read.h"
+#include "ed_dump.h"
 #define A_L 16
 #define ext_w 6
 #define r_simi_w 0.05
@@ -12975,6 +12976,7 @@ uint32_t align_hc_ed_post_extz(overlap_region *z, All_reads *rref, char* qstr, c
             t_l = t_pri_l;
             // t_end = Reserve_Banded_BPM(t_string, aln_l, q_string, q_l, thre, &error);
             ed_band_cal_semi_64_w_absent_diag(t_string, t_l, q_string, q_l, thre, aux_beg, exz);
+            ha_ed_dump_semi64(t_string, t_l, q_string, q_l, thre, aux_beg, exz->err, exz->pe); // no-op unless HA_ED_DUMP is set
 
             // if(z->x_id == 5569 && z->y_id == 5557 && q_s == 10075 && q_e == 10849) {
             //     fprintf(stderr, "\n[M::%s::semi::t_s->%ld::t_pri_l->%ld::aux_beg->%ld::aux_end->%ld::thre->%ld] exz->ps::%d, exz->pe::%d, exz->ts::%d, exz->te::%d, exz->err::%d, exz->cigar.n::%d, thre::%ld\n", 

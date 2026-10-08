@@ -20,3 +20,4 @@
 hifiasm
 *.log
 CLAUDE.md
+gpu/ed_replay
