@@ -254,7 +254,8 @@ int ha_gpu_init(void)
     CU(cudaMalloc((void **)&g_dj, STAGE_JOBS * sizeof(*g_dj)));
     CU(cudaMalloc((void **)&g_dr, STAGE_JOBS * sizeof(*g_dr)));
     CU(cudaHostAlloc((void **)&g_upload_stage, UPLOAD_CH, cudaHostAllocDefault));
-    ha_gpu_verify = getenv("HA_GPU_VERIFY") ? 1 : 0;
+    const char *verify_env = getenv("HA_GPU_VERIFY");
+    ha_gpu_verify = (verify_env && *verify_env && strcmp(verify_env, "0") != 0) ? 1 : 0;
     fprintf(stderr, "[M::%s] using %s (sm_%d%d, %d SMs, %.1f GB)%s; init %.2f s\n", __func__, prop.name, prop.major, prop.minor,
             prop.multiProcessorCount, prop.totalGlobalMem / 1073741824.0, ha_gpu_verify ? ", verify mode" : "",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());

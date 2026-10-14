@@ -795,7 +795,7 @@ void get_queries(int argc, char *argv[], ketopt_t* opt, hifiasm_opt_t* asm_opt)
         if (dfp == 0) {
             fprintf(stderr, "[ERROR] Cannot find the input read file: %s\n", 
                     asm_opt->read_file_names[i]);
-		    exit(0);
+		    exit(1);
         } else if(asm_opt->is_sc){
             ks = kseq_init(dfp);
             while (((ret = kseq_read(ks)) >= 0)) {
