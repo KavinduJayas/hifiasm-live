@@ -1,4 +1,4 @@
-NVCC ?= /usr/local/cuda/bin/nvcc
+NVCC ?= nvcc
 ARCH ?= sm_89
 NVCCFLAGS = -O3 -arch=$(ARCH) -std=c++14 -Xcompiler -O3,-Wall
 
