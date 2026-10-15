@@ -44,9 +44,10 @@ round: ~43 candidate overlaps × ~11 windows ≈ 490 independent DP jobs. ONT:
 Why it ports cleanly: the kernel (`Levenshtein_distance.h`, `HA_ED_INIT(64)` family) is
 register-only Myers/Hyyrö bit-vector edit distance with no allocation, no SIMD, and one
 global (`seq_nt4_table` → `__constant__`). One thread per window. Per job the host only
-needs `(x_id, y_id, q_s, t_s, strand, thre, aux_beg)` ≈ 24 B; both sequences come from
-GPU-resident 2-bit packed reads, which also removes the 115M `recover_UC_Read_sub_region`
-decodes (2.7%). Output per job: `(err, ps, pe, ts, te)`.
+needs `(q_s, t_s, strand, thre, aux_beg)` plus buffer offsets; both sequences come from
+2-bit packed reads (originally planned device-resident, now streamed per batch, see
+step 2+3), which also removes the 115M `recover_UC_Read_sub_region` decodes (2.7%).
+Output per job: `(err, pe)`.
 
 Control-flow change needed: today each window's result is consumed immediately
 (`is_align` → `push_hc_wlst_exz` gap-fill + traceback). Split into: (a) collect all
@@ -68,18 +69,23 @@ Steps:
 2. + 3. **Done: `--gpu` (`make GPU=1`).** Implementation in `gpu/ed_batch.{h,cu}`,
    hooked into `Correct.cpp` (`enum_hc_ed_wins_gpu`, `gen_hc_r_alin`,
    `gen_hc_r_alin_nec`, `align_hc_ed_post_extz`), `Assembly.cpp` (`ha_gpu_init` /
-   `ha_gpu_upload_reads` per EC round / `ha_gpu_destroy`) and `CommandLines.cpp`.
-   - Reads are uploaded once per EC round in their existing 2-bit packing
-     (`read_sperate`, padded to 8 bytes per read) plus a CSR list of N positions from
-     `N_site`; the device accessor reproduces `recover_UC_Read_sub_region` including
-     reverse strand and N restoration. A job is 36 bytes of coordinates.
+   `ha_gpu_new_round` per EC round / `ha_gpu_destroy`) and `CommandLines.cpp`.
+   - Sequences are streamed with the jobs. A context carries the 2-bit words of its
+     query read (once) and, per overlap, the forward-strand word range of the target
+     that its windows read, copied straight from `read_sperate` (2 KB-ish per overlap,
+     ~185 B per window measured), plus the N positions in that range from `N_site`. The
+     device accessor reproduces `recover_UC_Read_sub_region` including reverse strand
+     and N restoration; a job is 60 bytes of coordinates and buffer offsets. Nothing
+     stays on the device between batches, so the read set can be any size.
    - Per read, `gen_hc_r_alin` enumerates every first-pass window of every overlap
      (same loop as `align_hc_ed_post_extz`), submits them as one context, and the
      unchanged CPU code then consumes `(err, pe)` from the result array instead of
      calling the kernel. Gap-fill, traceback, phasing and consensus are untouched.
    - Worker threads never call CUDA. A single service thread merges every context
      waiting in the queue into one launch (mean 1.3–10k jobs) and scatters results
-     back; workers block on a condition variable. This matters: per-read batches from
+     back; workers block on a condition variable. Two pinned/device staging slots
+     (153 MB each) alternate, so the host-side gather and transfers of one chunk
+     overlap the kernel of the previous one. This matters: per-read batches from
      16 streams do **not** overlap on the device (`gpu/ed_batchbench.cu`: 0.84 →
      1.06 M jobs/s going from 1 to 16 threads at batch 500, vs 3.9 M jobs/s at batch
      8000). `kthread` creates fresh pthreads per pass, so contexts come from a pool,
@@ -93,7 +99,7 @@ Steps:
    - Timing on the RTX 500 (16 SMs, WSL2), interleaved with CPU runs: steady-state EC
      rounds are at parity with 16 cores (round 2 +0.2 s, round 3 −0.4 s); the only net
      loss is the one-off 2.75 s CUDA context creation. Per-round GPU stats
-     (`[M::ha_gpu_upload_reads] ... kernel X s, service Y s, worker wait Z thread-s`)
+     (`[M::ha_gpu_new_round] ... kernel X s, service Y s, worker wait Z thread-s`)
      show the device saturated: ~0.34 µs/window in situ, ~0.25 ms WSL2 overhead per
      launch, and every worker waiting ~0.5 s per round for results. A V100/A100 has
      ~6–10x the throughput and ~10x lower launch latency, which is where the predicted
@@ -148,32 +154,27 @@ pointer-chasing graph code. The only data-parallel pieces there are
   must span many reads to fill the device. `kt_for_ec` already has the new-reads-then-
   dirty-reads ordering that a batched design must preserve.
 - Pass ordering to keep: hap_ec → sl_ec → update_dc_ec → post_rev. `sl_ec` and
-  `post_rev` mutate read storage, so GPU-resident reads must be re-uploaded (or updated
-  in place) after each.
+  `post_rev` mutate read storage; streaming the sequences with each batch (rather than
+  keeping them device-resident) means the GPU always sees the current `read_sperate`.
 
 ## 4. Hardware and expectations
 
 Dev machine: RTX 500 Ada laptop GPU, 4 GB, sm_89, CUDA 12.6 at `/usr/local/cuda` (not on
-`PATH`). A human-scale 2-bit read set is not resident there; develop on the chr11 subset.
+`PATH`). Develop on the chr11 subset.
 
-Device memory is the limit of the resident-reads design. The first Gadi run (E1
-incremental, `--ont -j`, gpuvolta V100-32GB, 2026-10-14) died with `cudaMalloc` out of
-memory at the first upload, after an hour of k-mer counting: the 3.36 G minimizers at
-w=51 imply ~115–125 Gbp of reads, i.e. 29–31 GB of 2-bit sequence against 31.7 GB on
-the card, and the allocator then rounded that up to a power of two. Since then:
-- allocations are exact, and `ha_gpu_check_fit` compares the footprint with
-  `cudaMemGetInfo` before allocating (printed every round as
-  `[M::ha_gpu_check_fit] ... X GB device memory needed, Y GB free`);
-- in `-j` mode the check also runs on the reads loaded from disk (a lower bound), right
-  after loading, so a run that cannot fit says so in minutes rather than hours;
-- a failed check or upload drops to the CPU kernel for the rest of the run
-  (`[W::ha_gpu_fallback]`) instead of aborting. `HA_GPU_MEM_CAP=<GB>` pretends the card
-  is smaller, to test this on the laptop.
-A 40x human ONT set is therefore at the edge of a 32 GB card and fits an 80 GB A100
-(`run_e1_sr_gpu.pbs`, dgxa100) with ~45 GB to spare, but every `--keep-alive` iteration
-grows the set. The next step is to stream each batch's target spans with its jobs
-(~230 B per window instead of 36, overlapped with the kernel; a fixed few hundred MB of
-device memory), chosen automatically when the resident copy does not fit.
+Device memory was the limit of the first (device-resident) design: the whole 2-bit read
+set was uploaded each EC round. The first Gadi run (E1 incremental, `--ont -j`, gpuvolta
+V100-32GB, 2026-10-14) died with `cudaMalloc` out of memory at the first upload, after
+an hour of k-mer counting: the 3.36 G minimizers at w=51 imply ~115–125 Gbp of reads,
+i.e. 29–31 GB of 2-bit sequence against 31.7 GB on the card. The streamed design
+replaced it on 2026-10-15: device memory is now a fixed ~310 MB of staging whatever the
+input, at the cost of ~185 B of sequence per window over PCIe (0.9 GB per round on
+chr11; ~0.5 TB per round projected for 40x human, overlapped with the kernel). On the
+RTX 500 the per-round service time rose ~25% (host gather) with kernel time unchanged;
+the resident version is in git history if a measurement on an A100 ever shows the
+transfer mattering. The per-round stats line reports the staged volume
+(`X GB of sequence staged`) and `N contexts (M free)`, which should stay at the thread
+count (a climbing number means a caller is not releasing its context).
 
 Amdahl: with 16 CPU threads the DP is already parallel, so T1 alone should cut
 EC-round time by roughly 35–45%; T1+T2+T3 together is where a 2–3x end-to-end EC gain

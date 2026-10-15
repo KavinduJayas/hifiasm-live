@@ -12956,7 +12956,7 @@ uint32_t align_ul_ed_post_extz(overlap_region *z, const ul_idx_t *uref, hpc_t *h
 static int enum_hc_ed_wins_gpu(overlap_region *z, All_reads *rref, double e_rate, int64_t w_l, ha_gpu_ctx_t *gc)
 {
     int64_t q_s, q_e, nw, k, q_l, t_tot_l, aux_beg, aux_end, t_s, thre, aln_l, t_pri_l;
-    ha_gpu_ed_job_t *jb;
+    ha_gpu_ed_job_t *jb; int32_t first = ha_gpu_ctx_n(gc);
     nw = get_num_wins(z->x_pos_s, z->x_pos_e+1, w_l);
     get_win_se_by_normalize_xs(z, (z->x_pos_s/w_l)*w_l, w_l, &q_s, &q_e);
     for (k = 0; k < nw; k++) {
@@ -12969,14 +12969,15 @@ static int enum_hc_ed_wins_gpu(overlap_region *z, All_reads *rref, double e_rate
         aln_l = q_l + (thre<<1); t_tot_l = Get_READ_LENGTH((*rref), z->y_id);
         if(init_waln(thre, t_s, t_tot_l, aln_l, &aux_beg, &aux_end, &t_s, &t_pri_l)) {
             jb = ha_gpu_ctx_push(gc); if(!jb) return 0;
-            jb->x_id = z->x_id; jb->y_id = z->y_id; jb->strand = z->y_pos_strand;
+            jb->strand = z->y_pos_strand;
             jb->q_s = q_s; jb->q_l = q_l; jb->t_s = t_s; jb->t_l = t_pri_l;
             jb->thre = thre; jb->aux_beg = aux_beg;
         }
         q_s = q_e + 1; q_e = q_s + w_l - 1;
         if(q_e >= (int64_t)z->x_pos_e) q_e = z->x_pos_e;
     }
-    return 1;
+    // stage the slice of the target that these windows read
+    return ha_gpu_ctx_add_target(gc, rref, z->y_id, first);
 }
 
 // gres: results from enum_hc_ed_wins_gpu for this overlap, or NULL to run the kernel here.
@@ -25681,7 +25682,7 @@ void gen_hc_r_alin(overlap_region_alloc* ol, Candidates_list *cl, All_reads *rre
     // the loop below then consumes the results instead of running the kernel per window.
     // Any failure drops back to the CPU path for this read.
     ha_gpu_ctx_t *gc = NULL; uint32_t *gstart = NULL; const ha_gpu_ed_res_t *gres = NULL;
-    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL) {
+    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL && ha_gpu_ctx_set_query(gc, rref, rid)) {
         gstart = (uint32_t*)malloc(sizeof(uint32_t)*ol->length);
         for (i = 0; i < ol->length; i++) {
             gstart[i] = ha_gpu_ctx_n(gc);
@@ -25756,7 +25757,7 @@ void gen_hc_r_alin_nec(overlap_region_alloc* ol, Candidates_list *cl, All_reads 
 
     // --gpu: same batching as gen_hc_r_alin, restricted to the overlaps aligned below
     ha_gpu_ctx_t *gc = NULL; uint32_t *gstart = NULL; const ha_gpu_ed_res_t *gres = NULL;
-    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL) {
+    if(asm_opt.use_gpu && (gc = ha_gpu_acquire()) != NULL && ha_gpu_ctx_set_query(gc, rref, rid)) {
         gstart = (uint32_t*)malloc(sizeof(uint32_t)*ol->length);
         for (i = 0; i < ol->length; i++) {
             gstart[i] = ha_gpu_ctx_n(gc);
