@@ -34,23 +34,52 @@ typedef struct {
     uint32_t *npos;   // sorted N positions per read (from R_INF.N_site)
     uint8_t  *all_n;  // 1 if read_sperate[i] == NULL (recover_UC_Read gives all 'N')
     uint64_t n_reads, seq_bytes, n_npos;
-    size_t cap_seq, cap_reads, cap_npos;
 } ha_gpu_reads_t;
 
 static ha_gpu_reads_t R;
 static int g_inited = 0;
 
-template <class X>
-static int dev_reserve(X **p, size_t *cap, size_t need)
+// Allocate exactly what the current read set needs. The earlier power-of-two growth
+// turned a 17-31 GB read set into a 32 GB request, which no 32 GB card can satisfy,
+// and the sequence array dominates device memory so there is nothing to amortise.
+static void dev_release(ha_gpu_reads_t *r)
 {
-    if (need <= *cap) return 1;
-    size_t n = *cap ? *cap : 1024;
-    while (n < need) n <<= 1;
-    if (*p) CU(cudaFree(*p));
-    *p = NULL; *cap = 0;
-    CU(cudaMalloc((void **)p, n * sizeof(X)));
-    *cap = n;
-    return 1;
+    cudaFree(r->seq); cudaFree(r->off); cudaFree(r->len); cudaFree(r->noff); cudaFree(r->npos); cudaFree(r->all_n);
+    memset(r, 0, sizeof(*r));
+}
+
+// Device bytes the resident copy of rs takes. all_n reads hold no sequence; every other
+// read is (len+3)/4 bytes rounded up to 8. Also returns the counts the upload needs.
+static uint64_t reads_footprint(const All_reads *rs, uint64_t *seq_bytes, uint64_t *n_npos)
+{
+    uint64_t n = rs->total_reads, i, sb = 0, np = 0;
+    for (i = 0; i < n; i++) {
+        if (rs->read_sperate[i]) sb += (((rs->read_length[i] + 3) >> 2) + 7) & ~(uint64_t)7;
+        if (rs->N_site[i]) np += rs->N_site[i][0];
+    }
+    *seq_bytes = sb; *n_npos = np;
+    return sb + 8 + (n + 1) * (8 + 4 + 8 + 1) + (np + 1) * 4;
+}
+
+// Compare the resident footprint of rs against free device memory (after releasing the
+// copy of the previous round, which is replaced anyway). Prints both so a run that is
+// about to fall back to the CPU says why.
+static const uint64_t FIT_MARGIN = (uint64_t)256 << 20; // allocator granularity, kernel stacks
+
+int ha_gpu_check_fit(const All_reads *rs, const char *what)
+{
+    if (!g_inited) return 0;
+    uint64_t sb, np, need = reads_footprint(rs, &sb, &np);
+    size_t mfree = 0, mtotal = 0;
+    dev_release(&R);
+    CU(cudaMemGetInfo(&mfree, &mtotal));
+    const char *cap = getenv("HA_GPU_MEM_CAP"); // GB; pretend the card is smaller (testing the fallback)
+    if (cap && atof(cap) > 0 && (uint64_t)(atof(cap) * 1073741824.0) < mfree) mfree = (size_t)(atof(cap) * 1073741824.0);
+    int ok = need + FIT_MARGIN <= mfree;
+    fprintf(stderr, "[%s::%s] %s: %lu reads, %.2f GB of 2-bit sequence, %.2f GB device memory needed, %.2f GB free of %.2f GB%s\n",
+            ok ? "M" : "W", __func__, what, (unsigned long)rs->total_reads, sb / 1073741824.0, need / 1073741824.0,
+            mfree / 1073741824.0, mtotal / 1073741824.0, ok ? "" : "; the reads do not fit on this GPU");
+    return ok;
 }
 
 // Sequence accessor over the device-resident reads: operator[](i) returns the 2-bit
@@ -268,10 +297,13 @@ int ha_gpu_init(void)
 
 static void print_stats(const char *who)
 {
-    fprintf(stderr, "[M::%s] %lu windows in %lu launches (mean %.0f, max %lu); kernel %.2f s, service %.2f s, worker wait %.2f thread-s\n",
+    size_t n_ctx, n_free;
+    { std::lock_guard<std::mutex> lk(g_lock); n_ctx = g_pool_all.size(); n_free = g_pool_free.size(); }
+    // contexts should stay near the thread count; a growing number means a caller is not releasing
+    fprintf(stderr, "[M::%s] %lu windows in %lu launches (mean %.0f, max %lu); kernel %.2f s, service %.2f s, worker wait %.2f thread-s; %zu contexts (%zu free)\n",
             who, (unsigned long)g_tot_jobs, (unsigned long)g_tot_batches,
             g_tot_batches ? (double)g_tot_jobs / g_tot_batches : 0.0, (unsigned long)g_max_batch,
-            g_ms_kernel / 1e3, g_ms_batch / 1e3, g_wait_us / 1e6);
+            g_ms_kernel / 1e3, g_ms_batch / 1e3, g_wait_us / 1e6, n_ctx, n_free);
     g_tot_jobs = g_tot_batches = g_max_batch = g_wait_us = 0; g_ms_kernel = g_ms_batch = 0;
 }
 
@@ -280,6 +312,7 @@ int ha_gpu_upload_reads(const All_reads *rs)
     if (!g_inited) return 0;
     if (g_tot_batches) print_stats(__func__); // stats of the round that just finished
     auto t0 = std::chrono::steady_clock::now();
+    if (!ha_gpu_check_fit(rs, "uploading reads")) return 0; // also frees the previous round's copy
     uint64_t n = rs->total_reads, i, k;
     std::vector<uint64_t> off(n + 1), noff(n + 1);
     std::vector<uint32_t> len(n), npos;
@@ -297,13 +330,12 @@ int ha_gpu_upload_reads(const All_reads *rs)
     }
     R.n_reads = n; R.seq_bytes = off[n]; R.n_npos = npos.size();
 
-    if (!dev_reserve(&R.seq, &R.cap_seq, (off[n] >> 3) + 1)) return 0;
-    if (!dev_reserve(&R.off, &R.cap_reads, n + 1)) return 0;
-    size_t cap_tmp;
-    cap_tmp = R.len ? R.cap_reads : 0;  if (!dev_reserve(&R.len, &cap_tmp, n + 1)) return 0;
-    cap_tmp = R.noff ? R.cap_reads : 0; if (!dev_reserve(&R.noff, &cap_tmp, n + 1)) return 0;
-    cap_tmp = R.all_n ? R.cap_reads : 0; if (!dev_reserve(&R.all_n, &cap_tmp, n + 1)) return 0;
-    if (!dev_reserve(&R.npos, &R.cap_npos, npos.size() + 1)) return 0;
+    CU(cudaMalloc((void **)&R.seq, (off[n] >> 3) * 8 + 8));
+    CU(cudaMalloc((void **)&R.off, (n + 1) * sizeof(*R.off)));
+    CU(cudaMalloc((void **)&R.len, (n + 1) * sizeof(*R.len)));
+    CU(cudaMalloc((void **)&R.noff, (n + 1) * sizeof(*R.noff)));
+    CU(cudaMalloc((void **)&R.all_n, n + 1));
+    CU(cudaMalloc((void **)&R.npos, (npos.size() + 1) * sizeof(*R.npos)));
 
     CU(cudaMemcpy(R.off, off.data(), (n + 1) * sizeof(uint64_t), cudaMemcpyHostToDevice));
     CU(cudaMemcpy(R.len, len.data(), n * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -348,8 +380,7 @@ void ha_gpu_destroy(void)
     g_hj = NULL; g_hr = NULL; g_dj = NULL; g_dr = NULL; g_upload_stage = NULL;
     cudaEventDestroy(g_ev0); cudaEventDestroy(g_ev1);
     cudaStreamDestroy(g_stream);
-    cudaFree(R.seq); cudaFree(R.off); cudaFree(R.len); cudaFree(R.noff); cudaFree(R.npos); cudaFree(R.all_n);
-    memset(&R, 0, sizeof(R));
+    dev_release(&R);
     print_stats(__func__);
     g_inited = 0;
 }

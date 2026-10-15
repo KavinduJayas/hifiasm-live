@@ -154,8 +154,26 @@ pointer-chasing graph code. The only data-parallel pieces there are
 ## 4. Hardware and expectations
 
 Dev machine: RTX 500 Ada laptop GPU, 4 GB, sm_89, CUDA 12.6 at `/usr/local/cuda` (not on
-`PATH`). A human-scale 2-bit read set (~25 GB) is not resident there; develop on the
-chr11 subset and stream target windows. Production needs a 40–80 GB card.
+`PATH`). A human-scale 2-bit read set is not resident there; develop on the chr11 subset.
+
+Device memory is the limit of the resident-reads design. The first Gadi run (E1
+incremental, `--ont -j`, gpuvolta V100-32GB, 2026-10-14) died with `cudaMalloc` out of
+memory at the first upload, after an hour of k-mer counting: the 3.36 G minimizers at
+w=51 imply ~115–125 Gbp of reads, i.e. 29–31 GB of 2-bit sequence against 31.7 GB on
+the card, and the allocator then rounded that up to a power of two. Since then:
+- allocations are exact, and `ha_gpu_check_fit` compares the footprint with
+  `cudaMemGetInfo` before allocating (printed every round as
+  `[M::ha_gpu_check_fit] ... X GB device memory needed, Y GB free`);
+- in `-j` mode the check also runs on the reads loaded from disk (a lower bound), right
+  after loading, so a run that cannot fit says so in minutes rather than hours;
+- a failed check or upload drops to the CPU kernel for the rest of the run
+  (`[W::ha_gpu_fallback]`) instead of aborting. `HA_GPU_MEM_CAP=<GB>` pretends the card
+  is smaller, to test this on the laptop.
+A 40x human ONT set is therefore at the edge of a 32 GB card and fits an 80 GB A100
+(`run_e1_sr_gpu.pbs`, dgxa100) with ~45 GB to spare, but every `--keep-alive` iteration
+grows the set. The next step is to stream each batch's target spans with its jobs
+(~230 B per window instead of 36, overlapped with the kernel; a fixed few hundred MB of
+device memory), chosen automatically when the resident copy does not fit.
 
 Amdahl: with 16 CPU threads the DP is already parallel, so T1 alone should cut
 EC-round time by roughly 35–45%; T1+T2+T3 together is where a 2–3x end-to-end EC gain

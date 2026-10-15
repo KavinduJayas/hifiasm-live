@@ -6,6 +6,7 @@ int ha_gpu_verify = 0;
 int ha_gpu_available(void) { return 0; }
 int ha_gpu_init(void) { return 0; }
 int ha_gpu_upload_reads(const All_reads *rs) { (void)rs; return 0; }
+int ha_gpu_check_fit(const All_reads *rs, const char *what) { (void)rs; (void)what; return 0; }
 void ha_gpu_destroy(void) {}
 ha_gpu_ctx_t *ha_gpu_acquire(void) { return 0; }
 void ha_gpu_release(ha_gpu_ctx_t *ctx) { (void)ctx; }

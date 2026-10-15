@@ -1047,6 +1047,15 @@ void prt_dbg_rs(FILE *fp, Debug_reads* x, uint64_t round)
     destory_UC_Read(&g_read);
 }
 
+// Leave the GPU path for the rest of the run (CPU kernel, identical results) instead of
+// aborting; the device-resident reads may simply not fit on this card.
+static void ha_gpu_fallback(const char *why)
+{
+    fprintf(stderr, "[W::%s] %s; continuing with the CPU edit-distance kernel\n", __func__, why);
+    asm_opt.use_gpu = 0;
+    ha_gpu_destroy();
+}
+
 void ha_ec(int64_t round, int num_pround, int des_idx, uint64_t *tot_b, uint64_t *tot_e)
 {
 	int hom_cov, het_cov, r_out = 0;
@@ -1078,10 +1087,7 @@ void ha_ec(int64_t round, int num_pround, int des_idx, uint64_t *tot_b, uint64_t
     // Output_corrected_fastq();
 
     // Reads change between rounds (sl_ec / post_rev), so refresh the GPU copy each round.
-    if (asm_opt.use_gpu && !ha_gpu_upload_reads(&R_INF)) {
-        fprintf(stderr, "[ERROR] failed to upload reads to the GPU\n");
-        exit(1);
-    }
+    if (asm_opt.use_gpu && !ha_gpu_upload_reads(&R_INF)) ha_gpu_fallback("could not upload the reads to the GPU");
 
     cal_ec_r(asm_opt.thread_num, round, num_pround, R_INF.total_reads, (round == (asm_opt.number_of_round-1))?1:0, tot_b, tot_e);
 
@@ -2144,6 +2150,11 @@ int ha_assemble(void)
         }
 		if (asm_opt.continue_from_prev_state == 0 && (asm_opt.flag & HA_F_WRITE_PAF)) Output_PAF();
         if (asm_opt.het_cov == -1024) hap_recalculate_peaks(asm_opt.output_file_name), ovlp_loaded = 2;
+        // In -j mode the loaded reads are a lower bound on what the GPU must hold (the new
+        // reads come on top); if they already do not fit, say so now rather than after the
+        // k-mer counting and index build.
+        if (asm_opt.use_gpu && asm_opt.continue_from_prev_state && !ha_gpu_check_fit(&R_INF, "reads loaded from disk, before the new reads are added"))
+            ha_gpu_fallback("the reads loaded from disk alone do not fit on the GPU");
 	}
 	if (!ovlp_loaded || asm_opt.continue_from_prev_state) {
         if(asm_opt.continue_from_prev_state && !ovlp_loaded) {

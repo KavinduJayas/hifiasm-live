@@ -25816,6 +25816,7 @@ void gen_hc_r_alin_nec(overlap_region_alloc* ol, Candidates_list *cl, All_reads 
         z = &(ol->list[k++]); z->is_match = 1; ///z->non_homopolymer_errors = re;
         z->strong = z->without_large_indel = 0;
     }
+    ha_gpu_release(gc); free(gstart);
     ol->length = k;
     if(ol->length <= 0) return;
 }

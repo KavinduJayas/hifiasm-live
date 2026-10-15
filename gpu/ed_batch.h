@@ -6,7 +6,8 @@
 //
 // Lifecycle:
 //   ha_gpu_init()                 once, before error correction (needs --gpu)
-//   ha_gpu_upload_reads(&R_INF)   at the start of every EC round (reads change between rounds)
+//   ha_gpu_upload_reads(&R_INF)   at the start of every EC round (reads change between rounds);
+//                                 on failure the caller drops to the CPU kernel
 //   per read, from a worker thread:
 //       gc = ha_gpu_acquire(); push jobs with ha_gpu_ctx_push(); ha_gpu_ctx_run(gc);
 //       read results with ha_gpu_ctx_res(); ha_gpu_release(gc);
@@ -38,6 +39,10 @@ extern int ha_gpu_verify;       // HA_GPU_VERIFY=1: also run the CPU kernel and 
 int ha_gpu_available(void);
 int ha_gpu_init(void);
 int ha_gpu_upload_reads(const All_reads *rs);
+// 1 if the resident copy of rs fits in free device memory; prints need vs free either
+// way. Cheap: call it as soon as the reads are known so a run that cannot use the GPU
+// says so before the index build, not an hour later.
+int ha_gpu_check_fit(const All_reads *rs, const char *what);
 void ha_gpu_destroy(void);
 
 ha_gpu_ctx_t *ha_gpu_acquire(void);
